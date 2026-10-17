@@ -139,7 +139,7 @@ func finishReadyWorkWithCounts(items []*types.IssueWithCounts, filter types.Work
 //
 // The page IDs are chunked into sqlbuild.QueryBatchSize batches so a large page
 // stays within every backend's per-statement placeholder limit (the by-IDs form
-// binds the page up to eight times) without falling back to the quadratic query.
+// binds the page up to twelve times) without falling back to the quadratic query.
 //
 // For limit <= 0 (unbounded) there is no page to push down, so it runs the
 // predicate-form mega-query unchanged.
@@ -165,33 +165,12 @@ func runReadyCountsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, li
 		return nil, nil
 	}
 
-	// Hydrate the counts for the resolved page, chunking the IN-list. The page
-	// IDs are already distinct, so a per-chunk scan needs no cross-chunk dedup.
-	byID := make(map[string]*types.IssueWithCounts, len(pageIDs))
-	for start := 0; start < len(pageIDs); start += sqlbuild.QueryBatchSize {
-		end := start + sqlbuild.QueryBatchSize
-		if end > len(pageIDs) {
-			end = len(pageIDs)
-		}
-		countsSQL, idArgs := sqlbuild.SearchCountsSQL(tables, pageIDs[start:end], "", "", "", includeWispReverseDeps, hyd)
-		rows, scanErr := scanCountsRowsInTx(ctx, tx, tables.Main, countsSQL, idArgs, hyd)
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		for _, r := range rows {
-			if r != nil && r.Issue != nil {
-				byID[r.Issue.ID] = r
-			}
-		}
-	}
-
-	// Restore the ready order the ID query already computed so the result stays
-	// identical to the unbounded mega-query's ORDER BY … LIMIT.
-	ordered := make([]*types.IssueWithCounts, 0, len(pageIDs))
-	for _, id := range pageIDs {
-		if r, ok := byID[id]; ok {
-			ordered = append(ordered, r)
-		}
+	// Hydrate the counts for the resolved page in batches, back in the ready
+	// order the ID query computed, so the result stays identical to the
+	// unbounded mega-query's ORDER BY … LIMIT.
+	ordered, err := hydrateCountsByIDsInTx(ctx, tx, tables, pageIDs, includeWispReverseDeps, hyd)
+	if err != nil {
+		return nil, err
 	}
 	return ordered, nil
 }
