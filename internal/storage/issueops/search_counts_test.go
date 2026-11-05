@@ -52,7 +52,14 @@ func TestSearchIssuesWithCountsHonorsSkipWisps(t *testing.T) {
 	_, mock, tx := beginMockTx(t)
 	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).
 		WillReturnRows(sqlmock.NewRows([]string{"1"}).AddRow(1))
-	mock.ExpectQuery(`(?s)FROM issues i.*ORDER BY i\.priority ASC, i\.created_at DESC, i\.id ASC`).
+	// Unbounded and small: the COUNT sizing the ids-first ceiling (1000 rows
+	// -> the 200 floor), the id scan under ceiling+1, then the sentinel by-IDs
+	// statement for the empty set.
+	mock.ExpectQuery(`^SELECT COUNT\(\*\) FROM issues$`).
+		WillReturnRows(sqlmock.NewRows([]string{"n"}).AddRow(1000))
+	mock.ExpectQuery(`^SELECT issues\.id FROM issues\s+ORDER BY priority ASC, created_at DESC, id ASC\s+LIMIT \d+$`).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	mock.ExpectQuery(`(?s)FROM issues i\s.*WHERE i\.id IN \(\?\)`).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
 
 	got, err := SearchIssuesWithCountsInTx(context.Background(), tx, "", types.IssueFilter{SkipWisps: true})

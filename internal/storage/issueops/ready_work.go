@@ -41,10 +41,55 @@ func buildReadyWorkOrder(policy types.SortPolicy) sqlbuild.ReadyWorkOrder {
 	return sqlbuild.BuildReadyWorkOrder(policy, "created_at", "priority")
 }
 
+// resolveReadyActiveStatusesInTx resolves, once per ready operation, the
+// active custom statuses the StatusOpen predicate binds instead of carrying a
+// custom_statuses subquery (#8045). It returns nil — unresolved, keeping the
+// subquery — for any other selector and when the read fails: the subquery
+// then reads the same table and surfaces the same error, so error behavior
+// is unchanged.
+func resolveReadyActiveStatusesInTx(ctx context.Context, tx DBTX, filter types.WorkFilter) []string {
+	if filter.Status != types.StatusOpen {
+		return nil
+	}
+	names, err := getActiveCustomStatusesInTx(ctx, tx)
+	if err != nil {
+		return nil
+	}
+	return names
+}
+
+// getActiveCustomStatusesInTx returns the category='active' custom status
+// names, never nil on success (an empty slice means "none", which the ready
+// predicate binds as plain `status = ?`).
+func getActiveCustomStatusesInTx(ctx context.Context, tx DBTX) ([]string, error) {
+	rows, err := tx.QueryContext(ctx, "SELECT name FROM custom_statuses WHERE category = 'active' ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // buildReadyWorkPredicates computes the ID sets the ready-work WHERE clause
 // needs (children of deferred parents, parent descendants), then delegates
 // the clause text to sqlbuild so both stacks share ready semantics.
-func buildReadyWorkPredicates(ctx context.Context, tx DBTX, filter types.WorkFilter, tables FilterTables) (*readyWorkPredicates, error) {
+//
+// activeCustomStatuses comes from resolveReadyActiveStatusesInTx, called once
+// per top-level ready operation and shared by its issue and wisp legs.
+func buildReadyWorkPredicates(ctx context.Context, tx DBTX, filter types.WorkFilter, tables FilterTables, activeCustomStatuses []string) (*readyWorkPredicates, error) {
 	var inputs sqlbuild.ReadyWorkWhereInputs
 	if !filter.IncludeDeferred {
 		deferredChildIDs, dcErr := getChildrenOfDeferredParentsInTx(ctx, tx)
@@ -64,6 +109,7 @@ func buildReadyWorkPredicates(ctx context.Context, tx DBTX, filter types.WorkFil
 		}
 		inputs.ParentDescendantIDs = descendantIDs
 	}
+	inputs.ActiveCustomStatuses = activeCustomStatuses
 
 	whereSQL, whereArgs, err := sqlbuild.BuildReadyWorkWhere(filter, tables, inputs)
 	if err != nil {
@@ -96,7 +142,7 @@ func GetReadyWorkInTx(
 	tx DBTX,
 	filter types.WorkFilter,
 ) ([]*types.Issue, error) {
-	preds, err := buildReadyWorkPredicates(ctx, tx, filter, IssuesFilterTables)
+	preds, err := buildReadyWorkPredicates(ctx, tx, filter, IssuesFilterTables, resolveReadyActiveStatusesInTx(ctx, tx, filter))
 	if err != nil {
 		return nil, err
 	}

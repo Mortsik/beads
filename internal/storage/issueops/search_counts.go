@@ -4,8 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"os"
 	"slices"
 	"sort"
+	"strconv"
 
 	"github.com/steveyegge/beads/internal/storage/sqlbuild"
 	"github.com/steveyegge/beads/internal/types"
@@ -109,6 +111,58 @@ func hydrationFor(filter types.IssueFilter) sqlbuild.CountsHydration {
 // predicate form. See runFilterSearchQueryInTx for why there is a ceiling.
 const countsIDsFirstMaxBound = sqlbuild.QueryBatchSize
 
+// An UNBOUNDED counts search (Limit 0, no MaxRows breaker) is answered
+// ids-first when its whole match set is small. The read first runs the id scan
+// under a probe bound of ceiling+1: a set that fits is hydrated through the
+// by-IDs form; a larger one falls back to the predicate form, having spent one
+// id-only scan.
+//
+// Pollers that read a whole open set every few seconds (bd ready --limit 0,
+// bd list --status <s> --limit 0) are the case it targets: the predicate form
+// groups every side table on each call (~1 s of server time on an idle 33k-
+// issue store, 6-20 s under load) while the matched sets are tens to hundreds
+// of rows.
+//
+// The ceiling scales with the table, because the two forms do: ids-first
+// costs a roughly fixed amount per hydrated id (~0.7 ms measured, dolt 2.5),
+// the predicate form a roughly fixed amount per call that grows with the side
+// tables. The crossover sat near 1,300 ids on a 33k-issue store (measured),
+// near 220 at 5k and past 1,500 at 46k wisps (#7643's tables), i.e. about
+// rows/25. One COUNT(*) on the main table (~1 ms at 33k) sizes it, clamped to
+// [countsIDsFirstMaxBound, countsIDsFirstUnboundedMaxCeiling].
+const (
+	countsIDsFirstUnboundedRowsPerID  = 25
+	countsIDsFirstUnboundedMaxCeiling = 2000
+)
+
+// countsIDsFirstUnboundedOverride, when >= 0, replaces the table-sized
+// ceiling: BD_COUNTS_IDS_FIRST_UNBOUNDED_MAX=<n> pins it, and 0 turns the
+// unbounded ids-first path off (the operator kill switch). -1 = unset.
+var countsIDsFirstUnboundedOverride = countsIDsFirstUnboundedOverrideFromEnv()
+
+func countsIDsFirstUnboundedOverrideFromEnv() int {
+	if v, err := strconv.Atoi(os.Getenv("BD_COUNTS_IDS_FIRST_UNBOUNDED_MAX")); err == nil && v >= 0 {
+		return v
+	}
+	return -1
+}
+
+// countsIDsFirstUnboundedCeilingInTx returns the largest unbounded match set
+// to answer ids-first for tables.Main; 0 means use the predicate form. A failed
+// COUNT returns 0, so the read keeps the predicate form and its errors.
+//
+//nolint:gosec // G201: table name is a fixed FilterTables value.
+func countsIDsFirstUnboundedCeilingInTx(ctx context.Context, tx DBTX, tables FilterTables) int {
+	if countsIDsFirstUnboundedOverride >= 0 {
+		return countsIDsFirstUnboundedOverride
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, fmt.Sprintf("SELECT COUNT(*) FROM %s", tables.Main)).Scan(&n); err != nil {
+		return 0
+	}
+	return min(max(n/countsIDsFirstUnboundedRowsPerID, countsIDsFirstMaxBound), countsIDsFirstUnboundedMaxCeiling)
+}
+
 func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, filter types.IssueFilter, tables FilterTables, includeWispReverseDeps bool) ([]*types.IssueWithCounts, error) {
 	// A PAGE BOUND IS ONLY EVER PUSHED UNDER AN ORDER THE QUERY CAN EXPRESS —
 	// the same rule searchTableInTxT applies on the plain seam. sqlbuild.OrderBy
@@ -153,18 +207,28 @@ func runFilterSearchQueryInTx(ctx context.Context, tx *sql.Tx, query string, fil
 		if err != nil {
 			return nil, err
 		}
-		if len(ids) == 0 {
-			// AN EMPTY PAGE STILL RESOLVES EVERY TABLE THE PREDICATE FORM READ.
-			// The id scan reads only the main table (and its labels), so on
-			// its own an empty page would answer a missing leases or
-			// wisp_comments table — neither of them optional (#5942) — with
-			// an empty success. One by-IDs statement over a sentinel id
-			// reaches the same tables the predicate form joined, so their
-			// errors still propagate; whatever it returns is discarded.
-			_, err := hydrateCountsByIDsInTx(ctx, tx, tables, []string{""}, includeWispReverseDeps, hydrationFor(filter))
-			return nil, err
+		return answerIDsFirstInTx(ctx, tx, tables, ids, includeWispReverseDeps, hydrationFor(filter))
+	}
+
+	// AN UNBOUNDED READ IS PROBED, THEN ANSWERED IDS-FIRST IF SMALL. With no
+	// bound there is no page to select, so the id scan runs under a probe bound
+	// of the table-sized ceiling+1 with the same filter and ORDER BY. A probe
+	// that comes back within the ceiling holds the complete matching set, in
+	// the predicate form's order, and is hydrated as a page would be; one that
+	// overflows falls through to the predicate form below. eff == 0 means
+	// neither Limit nor MaxRows is set, so the probe bound is the only bound.
+	if eff == 0 && !goSideSort && labelJoinsMatchPredicate(filter) {
+		if ceiling := countsIDsFirstUnboundedCeilingInTx(ctx, tx, tables); ceiling > 0 {
+			probe := filter
+			probe.Limit = ceiling + 1
+			ids, err := searchTableInTxT(ctx, tx, query, probe, tables, idProjection)
+			if err != nil {
+				return nil, err
+			}
+			if len(ids) <= ceiling {
+				return answerIDsFirstInTx(ctx, tx, tables, ids, includeWispReverseDeps, hydrationFor(filter))
+			}
 		}
-		return hydrateCountsByIDsInTx(ctx, tx, tables, ids, includeWispReverseDeps, hydrationFor(filter))
 	}
 
 	whereClauses, args, err := BuildIssueFilterClauses(query, filter, tables)
@@ -208,6 +272,24 @@ func runSearchQueryInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, wh
 // the predicate form; the plain seam's own reading is left as it is.
 func labelJoinsMatchPredicate(filter types.IssueFilter) bool {
 	return !slices.Contains(filter.Labels, "") && !slices.Contains(filter.LabelsAny, "")
+}
+
+// answerIDsFirstInTx answers a counts search from an id scan's result: the
+// complete, ordered set of ids the search matches (a page, or a probed
+// unbounded set that fit under its ceiling).
+//
+// AN EMPTY SET STILL RESOLVES EVERY TABLE THE PREDICATE FORM READ. The id scan
+// reads only the main table (and its labels), so on its own an empty set would
+// answer a missing leases or wisp_comments table — neither of them optional
+// (#5942) — with an empty success. One by-IDs statement over a sentinel id
+// reaches the same tables the predicate form joined, so their errors still
+// propagate; whatever it returns is discarded.
+func answerIDsFirstInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, ids []string, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
+	if len(ids) == 0 {
+		_, err := hydrateCountsByIDsInTx(ctx, tx, tables, []string{""}, includeWispReverseDeps, hyd)
+		return nil, err
+	}
+	return hydrateCountsByIDsInTx(ctx, tx, tables, ids, includeWispReverseDeps, hyd)
 }
 
 // hydrateCountsByIDsInTx hydrates the counts rows for ids through the by-IDs

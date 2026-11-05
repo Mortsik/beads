@@ -2,6 +2,7 @@ package issueops
 
 import (
 	"context"
+	"database/sql"
 	"database/sql/driver"
 	"fmt"
 	"math/rand"
@@ -58,6 +59,16 @@ func idRows(ids ...string) *sqlmock.Rows {
 }
 
 func probeRow() *sqlmock.Rows { return sqlmock.NewRows([]string{"1"}).AddRow(1) }
+
+// setCountsIDsFirstUnboundedMax pins the unbounded ids-first ceiling for one
+// test, skipping the table COUNT that sizes it. Only sequential (non-t.Parallel) tests may call it: parallel tests
+// resume after every sequential test has finished and run its cleanups.
+func setCountsIDsFirstUnboundedMax(t *testing.T, n int) {
+	t.Helper()
+	prev := countsIDsFirstUnboundedOverride
+	countsIDsFirstUnboundedOverride = n
+	t.Cleanup(func() { countsIDsFirstUnboundedOverride = prev })
+}
 
 func pageIDs(prefix string, n int) []string {
 	ids := make([]string, n)
@@ -277,6 +288,9 @@ func TestSearchIssuesWithCountsEmptyIDScanStillResolvesTables(t *testing.T) {
 // a label filter with an empty entry, which the id scan's label JOINs would
 // drop (labelJoinsMatchPredicate).
 func TestSearchIssuesWithCountsPredicateFormWhenNotIDsFirst(t *testing.T) {
+	// The "unbounded" case pins the predicate form with the unbounded
+	// ids-first path off; that path has its own tests below.
+	setCountsIDsFirstUnboundedMax(t, 0)
 	const oneLabel = `id IN \(SELECT issue_id FROM labels WHERE label = \?\)`
 	for _, tc := range []struct {
 		name   string
@@ -318,5 +332,190 @@ func TestSearchIssuesWithCountsPredicateFormWhenNotIDsFirst(t *testing.T) {
 				t.Fatalf("unmet sql expectations: %v", err)
 			}
 		})
+	}
+}
+
+// TestSearchIssuesWithCountsUnboundedSmallSetGoesIDsFirst pins the unbounded
+// path: the id scan runs under a probe bound of the pinned ceiling+1,
+// and a set that fits is hydrated by ids — never the predicate form.
+func TestSearchIssuesWithCountsUnboundedSmallSetGoesIDsFirst(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, 5)
+	_, mock, tx := beginMockTx(t)
+	ids := []string{"bd-2", "bd-1"}
+
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(idScanSQL("issues", "labels", 6)).WithArgs("hot").WillReturnRows(idRows(ids...))
+	mock.ExpectQuery(byIDsSQL("issues", 2)).WithArgs(byIDsArgs(IssuesFilterTables, ids, true)...).WillReturnRows(emptyCountsRows())
+
+	filter := types.IssueFilter{Labels: []string{"hot"}, SortBy: "created", SkipWisps: true}
+	if _, err := SearchIssuesWithCountsInTx(context.Background(), tx, "", filter); err != nil {
+		t.Fatalf("SearchIssuesWithCountsInTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestSearchIssuesWithCountsUnboundedEmptySetProbesTables pins that an empty
+// unbounded set still issues the sentinel by-IDs statement, so a missing
+// required table errors as the predicate form would (#5942).
+func TestSearchIssuesWithCountsUnboundedEmptySetProbesTables(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, 5)
+	_, mock, tx := beginMockTx(t)
+
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(idScanSQL("issues", "labels", 6)).WithArgs("hot").WillReturnRows(idRows())
+	mock.ExpectQuery(byIDsSQL("issues", 1)).WithArgs(byIDsArgs(IssuesFilterTables, []string{""}, true)...).WillReturnRows(emptyCountsRows())
+
+	filter := types.IssueFilter{Labels: []string{"hot"}, SortBy: "created", SkipWisps: true}
+	got, err := SearchIssuesWithCountsInTx(context.Background(), tx, "", filter)
+	if err != nil {
+		t.Fatalf("SearchIssuesWithCountsInTx: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %d rows, want none", len(got))
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestSearchIssuesWithCountsUnboundedOverflowKeepsPredicateForm pins the
+// fallback: a probe that returns more than the ceiling means the set is
+// large, and the predicate form answers it, unbounded.
+func TestSearchIssuesWithCountsUnboundedOverflowKeepsPredicateForm(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, 2)
+	_, mock, tx := beginMockTx(t)
+
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(idScanSQL("issues", "labels", 3)).WithArgs("hot").WillReturnRows(idRows("bd-3", "bd-2", "bd-1"))
+	mock.ExpectQuery(`(?s)^\s*SELECT .*FROM \(\s*SELECT i\.\*\s+FROM issues i\s+WHERE id IN \(SELECT issue_id FROM labels WHERE label = \?\)\s*\) i\s.*ORDER BY i\.created_at DESC, i\.id ASC\s*$`).
+		WithArgs("hot").WillReturnRows(emptyCountsRows())
+
+	filter := types.IssueFilter{Labels: []string{"hot"}, SortBy: "created", SkipWisps: true}
+	if _, err := SearchIssuesWithCountsInTx(context.Background(), tx, "", filter); err != nil {
+		t.Fatalf("SearchIssuesWithCountsInTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestGetReadyWorkWithCountsUnboundedGoesIDsFirst pins the unbounded ready
+// read (bd ready --limit 0): active custom statuses resolved once and bound,
+// the ready id scan under the probe bound, then by-IDs hydration — never the
+// predicate form or the custom_statuses subquery.
+func TestGetReadyWorkWithCountsUnboundedGoesIDsFirst(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, 5)
+	_, mock, tx := beginMockTx(t)
+	ids := []string{"bd-1", "bd-2"}
+
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(`^SELECT name FROM custom_statuses WHERE category = 'active' ORDER BY name$`).
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("review"))
+	mock.ExpectQuery(`^SELECT id FROM issues WHERE status IN \(\?,\?\) AND .* LIMIT 6$`).
+		WillReturnRows(idRows(ids...))
+	mock.ExpectQuery(byIDsSQL("issues", 2)).WithArgs(byIDsArgs(IssuesFilterTables, ids, true)...).WillReturnRows(emptyCountsRows())
+	mock.ExpectQuery(`SELECT 1 FROM wisps LIMIT 1`).WillReturnError(sql.ErrNoRows)
+
+	filter := types.WorkFilter{IncludeDeferred: true, Status: types.StatusOpen}
+	if _, err := GetReadyWorkWithCountsInTx(context.Background(), tx, filter); err != nil {
+		t.Fatalf("GetReadyWorkWithCountsInTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestGetReadyWorkWithCountsUnboundedOverflowKeepsPredicateForm pins the
+// fallback for a ready set larger than the ceiling.
+func TestGetReadyWorkWithCountsUnboundedOverflowKeepsPredicateForm(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, 1)
+	_, mock, tx := beginMockTx(t)
+
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(`^SELECT id FROM issues WHERE .* LIMIT 2$`).WillReturnRows(idRows("bd-1", "bd-2"))
+	mock.ExpectQuery(`(?s)^\s*SELECT .*FROM \(\s*SELECT i\.\*\s+FROM issues i\s+WHERE .*\) i\s.*ORDER BY .*id ASC\s*$`).
+		WillReturnRows(emptyCountsRows())
+	mock.ExpectQuery(`SELECT 1 FROM wisps LIMIT 1`).WillReturnError(sql.ErrNoRows)
+
+	if _, err := GetReadyWorkWithCountsInTx(context.Background(), tx, readyFilter()); err != nil {
+		t.Fatalf("GetReadyWorkWithCountsInTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestCountsIDsFirstUnboundedCeilingScalesWithTheTable pins the table-sized
+// ceiling: rows/25 clamped to [countsIDsFirstMaxBound, 2000], and a failed
+// COUNT turning the unbounded ids-first path off.
+func TestCountsIDsFirstUnboundedCeilingScalesWithTheTable(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, -1)
+	for _, tc := range []struct {
+		rows int
+		want int
+	}{{rows: 144, want: countsIDsFirstMaxBound}, {rows: 7357, want: countsIDsFirstMaxBound + 94}, {rows: 33197, want: 1327}, {rows: 500000, want: 2000}} {
+		_, mock, tx := beginMockTx(t)
+		mock.ExpectQuery(`^SELECT COUNT\(\*\) FROM issues$`).WillReturnRows(sqlmock.NewRows([]string{"n"}).AddRow(tc.rows))
+		if got := countsIDsFirstUnboundedCeilingInTx(context.Background(), tx, IssuesFilterTables); got != tc.want {
+			t.Fatalf("rows=%d: ceiling %d, want %d", tc.rows, got, tc.want)
+		}
+	}
+	_, mock, tx := beginMockTx(t)
+	mock.ExpectQuery(`^SELECT COUNT\(\*\) FROM issues$`).WillReturnError(fmt.Errorf("boom"))
+	if got := countsIDsFirstUnboundedCeilingInTx(context.Background(), tx, IssuesFilterTables); got != 0 {
+		t.Fatalf("failed COUNT: ceiling %d, want 0", got)
+	}
+}
+
+// TestGetReadyWorkWithCountsMaxRowsKeepsItsBound pins that a MaxRows breaker
+// (Limit 0, MaxRows n) never takes the unbounded probe: the predicate form
+// runs under LIMIT n+1, so at most n+1 rows are ever hydrated — no COUNT, no
+// ceiling-sized id scan.
+func TestGetReadyWorkWithCountsMaxRowsKeepsItsBound(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, 5)
+	_, mock, tx := beginMockTx(t)
+
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(`(?s)^\s*SELECT .*FROM \(\s*SELECT i\.\*\s+FROM issues i\s+WHERE .*\) i\s.*ORDER BY .*id ASC\s+LIMIT 2\s*$`).
+		WillReturnRows(emptyCountsRows())
+	mock.ExpectQuery(`SELECT 1 FROM wisps LIMIT 1`).WillReturnError(sql.ErrNoRows)
+
+	filter := readyFilter()
+	filter.MaxRows = 1
+	if _, err := GetReadyWorkWithCountsInTx(context.Background(), tx, filter); err != nil {
+		t.Fatalf("GetReadyWorkWithCountsInTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
+	}
+}
+
+// TestGetReadyWorkWithCountsResolvesActiveStatusesOnce pins that one ready
+// read over both planes resolves the active custom statuses once and binds
+// them on both legs. sqlmock runs expectations in order, so a second
+// custom_statuses read would be unexpected, fall back to the subquery, and
+// fail the wisp probe's `status IN (?,?)` match.
+func TestGetReadyWorkWithCountsResolvesActiveStatusesOnce(t *testing.T) {
+	setCountsIDsFirstUnboundedMax(t, 5)
+	_, mock, tx := beginMockTx(t)
+	issueIDs := []string{"bd-1"}
+
+	mock.ExpectQuery(`SELECT 1 FROM wisp_dependencies LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(`^SELECT name FROM custom_statuses WHERE category = 'active' ORDER BY name$`).
+		WillReturnRows(sqlmock.NewRows([]string{"name"}).AddRow("review"))
+	mock.ExpectQuery(`^SELECT id FROM issues WHERE status IN \(\?,\?\) AND .* LIMIT 6$`).WillReturnRows(idRows(issueIDs...))
+	mock.ExpectQuery(byIDsSQL("issues", 1)).WithArgs(byIDsArgs(IssuesFilterTables, issueIDs, true)...).WillReturnRows(emptyCountsRows())
+	mock.ExpectQuery(`SELECT 1 FROM wisps LIMIT 1`).WillReturnRows(probeRow())
+	mock.ExpectQuery(`^SELECT id FROM wisps WHERE status IN \(\?,\?\) AND .* LIMIT 6$`).WillReturnRows(idRows())
+	mock.ExpectQuery(byIDsSQL("wisps", 1)).WithArgs(byIDsArgs(WispsFilterTables, []string{""}, true)...).WillReturnRows(emptyCountsRows())
+
+	filter := types.WorkFilter{IncludeDeferred: true, Status: types.StatusOpen}
+	if _, err := GetReadyWorkWithCountsInTx(context.Background(), tx, filter); err != nil {
+		t.Fatalf("GetReadyWorkWithCountsInTx: %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet sql expectations: %v", err)
 	}
 }

@@ -333,6 +333,8 @@ func readyFilter() types.WorkFilter {
 // substring of the message: the query text names the joined tables, so a
 // substring check would pass on any error that merely echoes the query.
 func TestCountsBrokenWispPlaneIsAnError(t *testing.T) {
+	// The primed expectations are the predicate form's statements.
+	setCountsIDsFirstUnboundedMax(t, 0)
 	for _, tc := range countsEntryPoints {
 		for _, missing := range tc.missing {
 			t.Run(tc.name+"/"+missing, func(t *testing.T) {
@@ -357,6 +359,8 @@ func TestCountsBrokenWispPlaneIsAnError(t *testing.T) {
 // count over it really does have no wisps to add. Over-tightening to "never
 // tolerate" passes every must-error assertion above and fails here.
 func TestCountsMissingWispPlaneIsNotAnError(t *testing.T) {
+	// The primed expectations are the predicate form's statements.
+	setCountsIDsFirstUnboundedMax(t, 0)
 	for _, tc := range countsEntryPoints {
 		for _, table := range []string{"wisps", "wisp_dependencies"} {
 			t.Run(tc.name+"/"+table, func(t *testing.T) {
@@ -382,6 +386,8 @@ func TestCountsMissingWispPlaneIsNotAnError(t *testing.T) {
 // not be a blanket catch in either direction. A deadlock or a dropped
 // connection was never a missing table and must still reach the caller.
 func TestCountsUnrelatedErrorPropagates(t *testing.T) {
+	// The primed expectations are the predicate form's statements.
+	setCountsIDsFirstUnboundedMax(t, 0)
 	for _, tc := range countsEntryPoints {
 		t.Run(tc.name, func(t *testing.T) {
 			_, mock, tx := beginMockTx(t)
@@ -399,6 +405,8 @@ func TestCountsUnrelatedErrorPropagates(t *testing.T) {
 // database whose wisp plane is intact, both legs answer and the merged number
 // is unchanged by the tightening.
 func TestCountsHealthyPlaneStillMerges(t *testing.T) {
+	// The primed expectations are the predicate form's statements.
+	setCountsIDsFirstUnboundedMax(t, 0)
 	_, mock, tx := beginMockTx(t)
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM issues`).WillReturnRows(scalarCountRows(3))
 	mock.ExpectQuery(`SELECT COUNT\(\*\) FROM wisps`).WillReturnRows(scalarCountRows(2))

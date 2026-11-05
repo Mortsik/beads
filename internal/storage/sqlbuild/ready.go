@@ -2,6 +2,7 @@ package sqlbuild
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -78,6 +79,13 @@ type ReadyWorkWhereInputs struct {
 	// ParentDescendantIDs are the transitive descendants of *filter.ParentID;
 	// consulted only when filter.ParentID != nil.
 	ParentDescendantIDs []string
+	// ActiveCustomStatuses are the category='active' custom status names,
+	// resolved by the caller; consulted only when filter.Status is
+	// StatusOpen. nil means unresolved and keeps the custom_statuses
+	// subquery; a non-nil (possibly empty) slice is bound as parameters
+	// instead, since Dolt evaluates `status IN (SELECT …)` far slower than a
+	// bound list (gastownhall/beads#8045).
+	ActiveCustomStatuses []string
 }
 
 // BuildReadyWorkWhere renders the full ready-work WHERE clause for one table
@@ -99,12 +107,29 @@ func BuildReadyWorkWhere(filter types.WorkFilter, tables FilterTables, in ReadyW
 		// eligible set: built-in open plus category-active custom statuses,
 		// matching the ready_issues view since migration 0025 (GH#5831).
 		// Any other singular status stays exact.
-		if filter.Status == types.StatusOpen {
+		switch {
+		case filter.Status == types.StatusOpen && in.ActiveCustomStatuses != nil:
+			statuses := []string{string(filter.Status)}
+			for _, name := range in.ActiveCustomStatuses {
+				if name != "" && !slices.Contains(statuses, name) {
+					statuses = append(statuses, name)
+				}
+			}
+			if len(statuses) == 1 {
+				statusClause = "status = ?"
+				args = append(args, statuses[0])
+			} else {
+				ph, statusArgs := InPlaceholders(statuses)
+				statusClause = fmt.Sprintf("status IN (%s)", ph)
+				args = append(args, statusArgs...)
+			}
+		case filter.Status == types.StatusOpen:
 			statusClause = "(status = ? OR status IN (SELECT name FROM custom_statuses WHERE category = 'active'))"
-		} else {
+			args = append(args, string(filter.Status))
+		default:
 			statusClause = "status = ?"
+			args = append(args, string(filter.Status))
 		}
-		args = append(args, string(filter.Status))
 	case len(filter.Statuses) > 0:
 		ph, statusArgs := InPlaceholders(filter.Statuses)
 		statusClause = fmt.Sprintf("status IN (%s)", ph)

@@ -33,7 +33,8 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 		return nil, fmt.Errorf("get ready work with counts: wisp dependency probe: %w", err)
 	}
 
-	issuePreds, err := buildReadyWorkPredicates(ctx, tx, filter, IssuesFilterTables)
+	activeStatuses := resolveReadyActiveStatusesInTx(ctx, tx, filter)
+	issuePreds, err := buildReadyWorkPredicates(ctx, tx, filter, IssuesFilterTables, activeStatuses)
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +54,7 @@ func GetReadyWorkWithCountsInTx(ctx context.Context, tx *sql.Tx, filter types.Wo
 		return finishReadyWorkWithCounts(out, filter)
 	}
 
-	wispPreds, err := buildReadyWorkPredicates(ctx, tx, filter, WispsFilterTables)
+	wispPreds, err := buildReadyWorkPredicates(ctx, tx, filter, WispsFilterTables, activeStatuses)
 	if err != nil {
 		return nil, err
 	}
@@ -153,6 +154,27 @@ func finishReadyWorkWithCounts(items []*types.IssueWithCounts, filter types.Work
 //nolint:gosec // G201: whereSQL/orderBySQL/limitSQL are hardcoded fragments; user input rides ? placeholders.
 func runReadyCountsInTx(ctx context.Context, tx *sql.Tx, tables FilterTables, limit int, preds *readyWorkPredicates, includeWispReverseDeps bool, hyd sqlbuild.CountsHydration) ([]*types.IssueWithCounts, error) {
 	if limit <= 0 {
+		// A truly unbounded ready read (no Limit and no MaxRows breaker, so no
+		// LIMIT in preds) is probed under the table-sized ceiling+1 and
+		// answered ids-first when the whole ready set fits; a larger set keeps
+		// the predicate form (see countsIDsFirstUnboundedCeilingInTx). The
+		// probe carries the ready ORDER BY, so a set that fits is already in
+		// the predicate form's order. A MaxRows breaker renders LIMIT
+		// MaxRows+1 and keeps the predicate form, which never reads more than
+		// that bound; a probe would hydrate up to the ceiling instead.
+		if preds.limitSQL != "" {
+			return runSearchQueryInTx(ctx, tx, tables, preds.whereSQL, preds.orderBySQL, preds.limitSQL, preds.args, includeWispReverseDeps, hyd)
+		}
+		if ceiling := countsIDsFirstUnboundedCeilingInTx(ctx, tx, tables); ceiling > 0 {
+			probeQuery := fmt.Sprintf("SELECT id FROM %s %s %s LIMIT %d", tables.Main, preds.whereSQL, preds.orderBySQL, ceiling+1)
+			ids, err := queryReadyIssueIDPage(ctx, tx, probeQuery, preds.args)
+			if err != nil {
+				return nil, err
+			}
+			if len(ids) <= ceiling {
+				return answerIDsFirstInTx(ctx, tx, tables, ids, includeWispReverseDeps, hyd)
+			}
+		}
 		return runSearchQueryInTx(ctx, tx, tables, preds.whereSQL, preds.orderBySQL, preds.limitSQL, preds.args, includeWispReverseDeps, hyd)
 	}
 
@@ -193,7 +215,8 @@ func CountReadyWorkInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter
 		return 0, fmt.Errorf("count ready work: wisp dependency probe: %w", err)
 	}
 
-	issuePreds, err := buildReadyWorkPredicates(ctx, tx, countFilter, IssuesFilterTables)
+	activeStatuses := resolveReadyActiveStatusesInTx(ctx, tx, countFilter)
+	issuePreds, err := buildReadyWorkPredicates(ctx, tx, countFilter, IssuesFilterTables, activeStatuses)
 	if err != nil {
 		return 0, err
 	}
@@ -212,7 +235,7 @@ func CountReadyWorkInTx(ctx context.Context, tx *sql.Tx, filter types.WorkFilter
 		return issueCount, nil
 	}
 
-	wispPreds, err := buildReadyWorkPredicates(ctx, tx, countFilter, WispsFilterTables)
+	wispPreds, err := buildReadyWorkPredicates(ctx, tx, countFilter, WispsFilterTables, activeStatuses)
 	if err != nil {
 		return 0, err
 	}
